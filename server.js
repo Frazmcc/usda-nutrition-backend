@@ -6,6 +6,7 @@ import crypto from 'crypto';
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// CORS allow *.bismo.me, *.onrender.com, localhost
 const allowOrigin = (origin) => {
   if (!origin) return true;
   try {
@@ -27,12 +28,14 @@ const API_KEY = process.env.USDA_API_KEY || "RN4eqxGte5HRZyIaAh6rQl98VfcRvcMdbVn
 const SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search";
 const DETAILS_URL = "https://api.nal.usda.gov/fdc/v1/food";
 
+// Cache (24h, 500 entries)
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_MAX = 500;
 const cache = new Map();
 function cacheGet(k){ const e=cache.get(k); if(!e) return null; if(Date.now()-e.at> CACHE_TTL_MS){ cache.delete(k); return null; } return e.value; }
 function cacheSet(k,v){ if(cache.size>=CACHE_MAX){ let ok=null,oa=Infinity; for(const [k2,v2] of cache){ if(v2.at<oa){oa=v2.at; ok=k2;} } if(ok) cache.delete(ok); } cache.set(k,{at:Date.now(),value:v}); }
 
+// Units
 const unitToGrams = {
   "g": 1, "gram": 1, "grams": 1,
   "kg": 1000,
@@ -47,30 +50,44 @@ const unitToGrams = {
 };
 
 function normalize(s){
-  return String(s).replace(/½/g,' 1/2').replace(/¼/g,' 1/4').replace(/¾/g,' 3/4').replace(/[–—]/g,'-').replace(/\s+/g,' ').trim();
+  return String(s)
+    .replace(/½/g,' 1/2')
+    .replace(/¼/g,' 1/4')
+    .replace(/¾/g,' 3/4')
+    .replace(/[–—]/g,'-')
+    .replace(/\s+/g,' ')
+    .trim();
 }
 function parseNumber(token){
   token = token.trim();
-  const range = token.match(/^(\\d+(?:\\.\\d+)?)\\s*(?:-|to)\\s*(\\d+(?:\\.\\d+)?)$/i);
+  const range = token.match(/^(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)$/i);
   if(range){ return (parseFloat(range[1])+parseFloat(range[2]))/2; }
   let total = 0;
-  for(const part of token.split(/\\s+/)){
-    if(/^(\\d+\\/\\d+)$/.test(part)){ const [a,b] = part.split('/').map(Number); total += a/b; }
-    else if(!isNaN(parseFloat(part))){ total += parseFloat(part); }
+  for(const part of token.split(/\s+/)){
+    // ✅ fixed regex
+    if(/^(\d+\/\d+)$/.test(part)){
+      const [a,b] = part.split('/').map(Number);
+      total += a/b;
+    } else if(!isNaN(parseFloat(part))){
+      total += parseFloat(part);
+    }
   }
   return total || NaN;
 }
 function parseLine(line){
   line = normalize(line);
-  const m = line.match(/^(\\d[^a-zA-Z]*)\\s*([a-zA-Z]+)?\\s*(.*)$/);
+  const m = line.match(/^(\d[^a-zA-Z]*)\s*([a-zA-Z]+)?\s*(.*)$/);
   if(!m) return null;
   const qty = parseNumber(m[1]);
   const unit = (m[2]||'').toLowerCase();
   let name = (m[3]||'').trim();
-  if(unit && !unitToGrams[unit] && name && !name.toLowerCase().startsWith(unit)){ name = unit + ' ' + name; }
+  if(unit && !unitToGrams[unit] && name && !name.toLowerCase().startsWith(unit)){
+    name = unit + ' ' + name;
+  }
   return { qty, unit, name };
 }
 
+// USDA helpers
 async function usdaSearch(name){
   const key = 'search:'+name.toLowerCase();
   const hit = cacheGet(key); if(hit) return hit;
@@ -92,22 +109,31 @@ async function usdaDetails(fdcId){
   return data;
 }
 
-function scorePer100g(per){ let s=0; if(per.kcal) s++; if(per.protein_g) s++; if(per.carbs_g) s++; if(per.fat_g) s++; return s; }
+// Scoring for best candidate (more macros present == better)
+function scorePer100g(per){
+  let s = 0;
+  if(per.kcal) s++;
+  if(per.protein_g) s++;
+  if(per.carbs_g) s++;
+  if(per.fat_g) s++;
+  return s;
+}
 
+// Robust extractor: handles foodNutrients (two shapes) + labelNutrients fallback
 function extractPer100gFromFood(food){
   const out = { kcal:0, protein_g:0, carbs_g:0, fat_g:0, sugar_g:0, satfat_g:0, sodium_mg:0 };
   const nlist = Array.isArray(food.foodNutrients) ? food.foodNutrients : [];
   for(const n of nlist){
-    let name = (n.nutrientName ?? n.nutrient?.name ?? '').toLowerCase();
-    let unit = (n.unitName ?? n.nutrient?.unitName ?? '').toLowerCase();
-    let val  = (typeof n.value === 'number') ? n.value : (typeof n.amount === 'number' ? n.amount : 0);
+    const name = (n.nutrientName ?? n.nutrient?.name ?? '').toLowerCase();
+    const unit = (n.unitName ?? n.nutrient?.unitName ?? '').toLowerCase();
+    const val  = (typeof n.value === 'number') ? n.value : (typeof n.amount === 'number' ? n.amount : 0);
     if(!name) continue;
     if (name.includes('energy')){ if(unit==='kcal') out.kcal=Math.max(out.kcal,val); if(unit==='kj') out.kcal=Math.max(out.kcal,val/4.184); }
-    if (name.startsWith('protein')) out.protein_g=Math.max(out.protein_g, unit==='g'?val:val);
-    if (name.includes('carbohydrate')) out.carbs_g=Math.max(out.carbs_g, unit==='g'?val:val);
-    if (name==='total lipid (fat)' || (name.includes('fat') && !name.includes('saturated'))) out.fat_g=Math.max(out.fat_g, unit==='g'?val:val);
-    if (name.includes('sugars')) out.sugar_g=Math.max(out.sugar_g, unit==='g'?val:val);
-    if (name.includes('fatty acids, total saturated') || name.includes('saturated fat')) out.satfat_g=Math.max(out.satfat_g, unit==='g'?val:val);
+    if (name.startsWith('protein')) out.protein_g=Math.max(out.protein_g, val);
+    if (name.includes('carbohydrate')) out.carbs_g=Math.max(out.carbs_g, val);
+    if (name==='total lipid (fat)' || (name.includes('fat') && !name.includes('saturated'))) out.fat_g=Math.max(out.fat_g, val);
+    if (name.includes('sugars')) out.sugar_g=Math.max(out.sugar_g, val);
+    if (name.includes('fatty acids, total saturated') || name.includes('saturated fat')) out.satfat_g=Math.max(out.satfat_g, val);
     if (name.includes('sodium')){ if(unit==='mg') out.sodium_mg=Math.max(out.sodium_mg,val); else if(unit==='g') out.sodium_mg=Math.max(out.sodium_mg,val*1000); }
   }
   const labels = food.labelNutrients;
@@ -147,6 +173,7 @@ function extractPer100gFromFood(food){
   return out;
 }
 
+// Portion resolution for items like "clove", "breast", "cup"
 function resolvePortionGrams(detail, unitToken){
   if(!detail || !Array.isArray(detail.foodPortions)) return null;
   const u = (unitToken||'').toLowerCase();
@@ -162,6 +189,7 @@ function resolvePortionGrams(detail, unitToken){
   }
   return null;
 }
+
 function scale(per100g, grams){
   const f = grams/100;
   return {
