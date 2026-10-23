@@ -1,0 +1,40 @@
+name: Security npm remediation audit
+on:
+  push:
+    branches: [security/npm-remediation-2026-10-23]
+permissions:
+  contents: write
+jobs:
+  audit_and_fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Apply compatible security fixes and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm audit fix --package-lock-only --ignore-scripts --no-fund || true
+          npm ci --no-fund
+          npm run build --if-present
+          npm test --if-present
+          if [ -f server.js ]; then node --check server.js; fi
+          npm audit --json > /tmp/npm-security-audit.json || true
+          node - <<'NODE'
+          const a=require('/tmp/npm-security-audit.json');
+          console.log('SECURITY_AUDIT_SUMMARY',JSON.stringify(a.metadata?.vulnerabilities||{}));
+          for (const [k,v] of Object.entries(a.vulnerabilities||{})) {
+            console.log('SECURITY_AUDIT_PACKAGE',JSON.stringify({name:k,severity:v.severity,isDirect:v.isDirect,range:v.range,fixAvailable:v.fixAvailable,via:v.via.filter(x=>typeof x==='object').map(x=>({name:x.name,title:x.title,range:x.range,url:x.url}))}));
+          }
+          NODE
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          if ! git diff --cached --quiet; then
+            git commit -m "security: apply compatible npm vulnerability fixes"
+            git push origin HEAD:security/npm-remediation-2026-10-23
+          fi
