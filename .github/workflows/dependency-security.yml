@@ -1,0 +1,30 @@
+name: Node dependency security and build checks
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --no-fund
+      - name: Validate backend syntax (when present)
+        shell: bash
+        run: |
+          if [ -f server.js ]; then node --check server.js; fi
+      - name: Build
+        run: npm run build --if-present
+      - name: Run available tests
+        run: npm test --if-present
+      - name: Enforce zero known npm advisories
+        run: npm audit --audit-level=low
